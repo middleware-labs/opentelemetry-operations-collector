@@ -118,6 +118,23 @@ regen-otelopscol-v:
 compare-otelopscol:
 	@$(GEN_OTELOPSCOL) --force --compare
 
+GEN_MIDDLEWARE_GPU=$(RUN_DISTROGEN) generate --spec ./specs/middleware-gpu-collector.yaml \
+								--registry ./components/middleware-gpu-collector/registry.yaml \
+								--templates ./templates/middleware-gpu-collector
+.PHONY: gen-middleware-gpu
+gen-middleware-gpu:
+	@$(GEN_MIDDLEWARE_GPU)
+	@cd middleware-gpu-collector && $(MAKE) clean-tools
+
+.PHONY: regen-middleware-gpu
+regen-middleware-gpu:
+	@$(GEN_MIDDLEWARE_GPU) -f
+	@cd middleware-gpu-collector && $(MAKE) clean-tools
+
+.PHONY: compare-middleware-gpu
+compare-middleware-gpu:
+	@$(GEN_MIDDLEWARE_GPU) --force --compare
+
 #########
 # Testing
 #########

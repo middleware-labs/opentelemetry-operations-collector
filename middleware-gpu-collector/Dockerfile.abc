@@ -1,0 +1,15 @@
+# Create a custom Dockerfile based on Middleware's image
+FROM ghcr.io/middleware-labs/otelcol-middleware-gpu:0.1.2
+
+USER root
+
+# Install DCGM client libraries (same as NVIDIA does)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        datacenter-gpu-manager-4-core \ 
+        datacenter-gpu-manager-4-proprietary \ 
+    && rm -rf /var/lib/apt/lists/* \
+    && ldconfig
+
+# Switch back to non-root user
+USER otelcol-middleware-gpu

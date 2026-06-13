@@ -1,0 +1,86 @@
+# Standalone Dockerfile for the Middleware GPU collector WITH the DCGM client
+# library baked in.
+#
+# Why DCGM is installed here: the dcgm receiver dlopen()s libdcgm.so at runtime
+# (it is a CGO build). The plain debian-slim runtime has no DCGM library, so the
+# receiver would log "libdcgm.so not Found" and collect nothing. Installing the
+# datacenter-gpu-manager core package provides libdcgm.so (and nv-hostengine).
+#
+# The NVIDIA driver / libnvidia-ml.so (used by the nvml receiver) is NOT baked
+# in -- it is injected by the NVIDIA Container Toolkit at run time via --gpus.
+#
+# Build context is the REPO ROOT (so the local GPU receivers can be compiled):
+#   docker build -f middleware-gpu-collector/Dockerfile.dcgm \
+#     -t ghcr.io/middleware-labs/otelcol-middleware-gpu:test .
+#
+# Run (GPU access + DCGM):
+#   docker run --rm --gpus all \
+#     -e MW_TARGET=... -e MW_API_KEY=... \
+#     -v "$PWD/config.example.yaml:/etc/otelcol-middleware-gpu/config.yaml:ro" \
+#     ghcr.io/middleware-labs/otelcol-middleware-gpu:test
+
+# ---------------------------------------------------------------------------
+# Build stage — compile the collector with the gpu build tag (CGO enabled)
+# ---------------------------------------------------------------------------
+ARG BUILD_CONTAINER="debian"
+FROM --platform=${BUILDPLATFORM:-linux/amd64} ${BUILD_CONTAINER} AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        make curl build-essential ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy the whole project so local components (dcgm/nvml receivers) are present.
+COPY . /
+WORKDIR /middleware-gpu-collector
+
+ARG BUILDARCH
+ARG TARGETARCH
+RUN if [ "${TARGETARCH}" = "arm64" ] && [ "${BUILDARCH}" != "arm64" ]; then \
+        apt-get update && apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross; \
+        CC=aarch64-linux-gnu-gcc; \
+    fi && \
+    CC=${CC} make build
+
+# ---------------------------------------------------------------------------
+# Runtime stage — debian-slim (glibc) + DCGM client library
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim
+
+# DCGM client library. NOTE: [trusted=yes] is used because NVIDIA's repo GPG key
+# uses SHA1, which newer Debian rejects; revert to signed-by once NVIDIA updates
+# their signing key. The *-core package provides libdcgm.so + nv-hostengine.
+# The debian12 NVIDIA repo apt version uses an epoch + revision, e.g. 1:4.5.3-1
+# (this differs from the .deb filename, which is just 4.5.3 -- check the real
+# value with `apt-cache madison datacenter-gpu-manager-4-core`).
+# DCGM_MAJOR selects the *-core package name; DCGM_APT_VERSION is the full pin.
+ARG DCGM_MAJOR=4
+ARG DCGM_APT_VERSION=1:4.5.3-1
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    echo "deb [trusted=yes] https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/ /" \
+        > /etc/apt/sources.list.d/cuda.list && \
+    apt-get -o Acquire::Retries=5 update && \
+    apt-get install -y --no-install-recommends \
+        "datacenter-gpu-manager-${DCGM_MAJOR}-core=${DCGM_APT_VERSION}" && \
+    rm -rf /var/lib/apt/lists/*
+
+# The nvml receiver dlopen()s the UNVERSIONED libnvidia-ml.so. The NVIDIA
+# Container Toolkit injects libnvidia-ml.so.1 at runtime (via --gpus) but not
+# the unversioned name, so we pre-create the symlink. It is a dangling link at
+# build time and resolves once the toolkit injects .so.1 at run time.
+# (Same approach as Meta's GCM image.)
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 \
+           /usr/lib/x86_64-linux-gnu/libnvidia-ml.so
+
+# Config directory must be traversable (x bit) by the non-root user, otherwise a
+# bind-mounted config yields "permission denied".
+RUN mkdir -p /etc/otelcol-middleware-gpu && chmod 755 /etc/otelcol-middleware-gpu
+
+ARG USER_UID=10001
+USER ${USER_UID}
+
+COPY --from=build --chmod=755 /middleware-gpu-collector/otelcol-middleware-gpu /otelcol-middleware-gpu
+COPY --from=build --chmod=644 /middleware-gpu-collector/config.yaml /etc/otelcol-middleware-gpu/config.yaml
+
+ENTRYPOINT ["/otelcol-middleware-gpu"]
+CMD ["--config=/etc/otelcol-middleware-gpu/config.yaml"]

@@ -1,0 +1,158 @@
+# Example configuration for the Middleware GPU OpenTelemetry Collector.
+#
+# Scrapes NVIDIA GPU telemetry (DCGM + NVML) and exports it to the
+# Middleware platform over OTLP.
+#
+# Set the following environment variables before running:
+#   MW_TARGET   - your Middleware OTLP endpoint, e.g. https://<uid>.middleware.io:443
+#   MW_API_KEY  - your Middleware API key
+#
+# Usage:
+#   otelcol-middleware-gpu --config=config.example.yaml
+
+receivers:
+  # NVIDIA Data Center GPU Manager metrics (requires the gpu build tag).
+  dcgm:
+    collection_interval: 30s
+  # NVIDIA Management Library metrics (requires the gpu build tag).
+  nvml:
+    collection_interval: 30s
+  # Receive OTLP from other agents/applications on this host (optional).
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Guard against unbounded memory use.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  # Tag metrics with host / cloud resource attributes.
+  # host.id must be explicitly requested for the system detector to emit it.
+  resourcedetection:
+    detectors: [env, system]
+    timeout: 5s
+    override: false
+    system:
+      resource_attributes:
+        host.id:
+          enabled: true
+  # Promote the per-GPU nvml datapoint attributes (gpu_number, uuid, model)
+  # up to resource attributes so each GPU is identified at the resource level.
+  transform/gpu_to_resource:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(resource.attributes["gpu.number"], attributes["gpu_number"]) where attributes["gpu_number"] != nil
+          - set(resource.attributes["gpu.uuid"], attributes["uuid"]) where attributes["uuid"] != nil
+          - set(resource.attributes["gpu.model"], attributes["model"]) where attributes["model"] != nil
+          - delete_key(attributes, "gpu_number")
+          - delete_key(attributes, "uuid")
+          - delete_key(attributes, "model")
+
+  # --- Derived GPU power (watts) + cumulative->delta conversion ---------------
+  # 1. Clone the cumulative energy counter into a new series we will turn into
+  #    watts, leaving the original energy counter intact for kWh / energy tiles.
+  metricstransform:
+    transforms:
+      - include: gpu.dcgm.energy_consumption
+        action: insert
+        new_name: gpu.dcgm.power_usage
+      # Clone the cumulative PCIe byte counter into a series we'll turn into a
+      # bytes/sec rate, leaving the original counter for total-bytes tiles.
+      - include: gpu.dcgm.pcie.io
+        action: insert
+        new_name: gpu.dcgm.pcie.io.rate
+      # Same for the cumulative NVLink byte counter.
+      - include: gpu.dcgm.nvlink.io
+        action: insert
+        new_name: gpu.dcgm.nvlink.io.rate
+
+  # 2. Convert cumulative monotonic sums to delta temporality. This covers all
+  #    dcgm cumulative counters (Middleware prefers delta) plus the power clone,
+  #    which deltatorate needs as a delta to work from.
+  cumulativetodelta:
+    include:
+      match_type: strict
+      metrics:
+        - gpu.dcgm.energy_consumption
+        - gpu.dcgm.power_usage
+        - gpu.dcgm.nvlink.io
+        - gpu.dcgm.nvlink.io.rate
+        - gpu.dcgm.pcie.io
+        - gpu.dcgm.pcie.io.rate
+        - gpu.dcgm.ecc_errors
+        - gpu.dcgm.xid_errors
+        - gpu.dcgm.clock.throttle_duration.time
+
+  # 3. Convert the clones from delta to a per-second rate. The interval is
+  #    divided out, so each value is correct at any scrape rate. deltatorate
+  #    emits the results as gauges.
+  #      power_usage:    ΔJ / Δs     = W
+  #      pcie.io.rate:   Δbytes / Δs = bytes/sec (per network.io.direction)
+  #      nvlink.io.rate: Δbytes / Δs = bytes/sec (per network.io.direction)
+  deltatorate:
+    metrics:
+      - gpu.dcgm.power_usage
+      - gpu.dcgm.pcie.io.rate
+      - gpu.dcgm.nvlink.io.rate
+
+  # 4. Relabel the derived metric's unit from J to W (deltatorate does not do
+  #    this), and round the watt value to 2 decimal places. This OTTL version
+  #    has no Round(), so emulate round-half-up with Int(x*100 + 0.5)/100
+  #    (power is always >= 0, so adding 0.5 before truncation rounds correctly).
+  transform/power_unit:
+    metric_statements:
+      - context: metric
+        statements:
+          # deltatorate auto-appends "/s" to units (J -> J/s, By -> By/s).
+          # Override the power unit to the friendlier W; pcie.io.rate already
+          # reads By/s from deltatorate, so it needs no relabel.
+          - set(unit, "W") where name == "gpu.dcgm.power_usage"
+      - context: datapoint
+        statements:
+          - set(value_double, Int(value_double * 100.0 + 0.5) / 100.0)
+              where metric.name == "gpu.dcgm.power_usage"
+          - set(value_double, Int(value_double * 100.0 + 0.5) / 100.0)
+              where metric.name == "gpu.dcgm.pcie.io.rate"
+          - set(value_double, Int(value_double * 100.0 + 0.5) / 100.0)
+              where metric.name == "gpu.dcgm.nvlink.io.rate"
+
+  # Batch before export for efficiency.
+  batch:
+    send_batch_size: 1024
+    timeout: 5s
+
+exporters:
+  # Primary export to Middleware over OTLP/HTTP.
+  otlphttp:
+    endpoint: ${env:MW_TARGET}
+    headers:
+      authorization: ${env:MW_API_KEY}
+  # Uncomment for local troubleshooting of the GPU metric stream.
+  # debug:
+  #   verbosity: detailed
+
+service:
+  pipelines:
+    metrics:
+      receivers: [dcgm, nvml, otlp]
+      # Order is execution order: promote GPU attrs, detect host, clone energy,
+      # cumulative->delta, delta->rate (watts), relabel unit, then batch.
+      processors:
+        - memory_limiter
+        - transform/gpu_to_resource
+        - resourcedetection
+        - metricstransform
+        - cumulativetodelta
+        - deltatorate
+        - transform/power_unit
+        - batch
+      exporters: [otlphttp]
+  telemetry:
+    logs:
+      level: info

@@ -1,0 +1,131 @@
+==============================================================================
+ Running the Middleware GPU Collector in Docker with config.example.yaml
+==============================================================================
+
+The container reads its config from:
+    /etc/otelcol-middleware-gpu/config.yaml
+
+config.example.yaml uses two environment variables, so they must be passed to
+the container at run time:
+    MW_TARGET   - Middleware OTLP endpoint (e.g. https://<uid>.middleware.io:443)
+    MW_API_KEY  - Middleware API key (sent as the Authorization header)
+
+The dcgm/nvml receivers talk to the NVIDIA driver, so the container needs GPU
+access via the NVIDIA Container Toolkit (the --gpus flag). Without a GPU the
+collector still starts but those receivers log scrape errors.
+
+All commands are run from this directory:
+    middleware-gpu-collector/
+
+
+------------------------------------------------------------------------------
+ 0. PULL THE PUBLISHED IMAGE (skip building)
+------------------------------------------------------------------------------
+
+# The image is published to GHCR. Just pull it instead of building:
+docker pull ghcr.io/middleware-labs/otelcol-middleware-gpu:0.1.2
+
+# (If the package is private, log in first:
+#    echo "$GH_TOKEN" | docker login ghcr.io -u <user> --password-stdin )
+
+
+------------------------------------------------------------------------------
+ 1. BUILD THE IMAGE (optional, alternative to pulling)
+------------------------------------------------------------------------------
+
+# Option A (recommended): build everything inside Docker. Uses Dockerfile.build,
+# which copies the project and compiles the collector (with the gpu build tag)
+# in an earlier layer. No prebuilt binary needed on the host.
+make image-build-full
+#   -> docker buildx build -f Dockerfile.build -t otelcol-middleware-gpu ..
+#   (context is the repo root "..", so the local GPU receivers can be compiled.)
+
+# Option B: if you have already run `make build` (binary present in this dir),
+# package that prebuilt binary into the runtime image using the plain Dockerfile.
+make image-build
+#   -> docker buildx build -t otelcol-middleware-gpu .
+#   (depends on the otelcol-middleware-gpu binary existing in this directory.)
+
+# Both produce a local image tagged "otelcol-middleware-gpu".
+
+
+------------------------------------------------------------------------------
+ 2. RUN THE CONTAINER WITH config.example.yaml
+------------------------------------------------------------------------------
+
+# Mount config.example.yaml over the path the container reads, pass the two
+# env vars, expose the OTLP ports, and grant GPU access.
+
+docker run --rm \
+  --name otelcol-middleware-gpu \
+  --gpus all \
+  -e MW_TARGET="https://kbuin.beta.env.middleware.io:443" \
+  -e MW_API_KEY="xtzrzvturlisziuvpdffwdsjavkwzpyplwrz" \
+  -v "$(pwd)/config.example.yaml:/etc/otelcol-middleware-gpu/config.yaml:ro" \
+  -p 4317:4317 \
+  -p 4318:4318 \
+  ghcr.io/middleware-labs/otelcol-middleware-gpu:0.1.2
+
+# Notes:
+#   --gpus all                grants all host GPUs (needs NVIDIA Container Toolkit)
+#   -v ...:...:ro             mounts your config read-only at the expected path
+#   -p 4317 / 4318            OTLP gRPC / HTTP receiver ports (optional; only
+#                             needed if other agents push OTLP into this collector)
+#   --rm                      remove the container when it exits
+
+
+------------------------------------------------------------------------------
+ 3. RUN IN THE BACKGROUND (detached)
+------------------------------------------------------------------------------
+
+docker run -d \
+  --name otelcol-middleware-gpu \
+  --restart unless-stopped \
+  --gpus all \
+  -e MW_TARGET="https://kbuin.beta.env.middleware.io:443" \
+  -e MW_API_KEY="xtzrzvturlisziuvpdffwdsjavkwzpyplwrz" \
+  -v "$(pwd)/config.example.yaml:/etc/otelcol-middleware-gpu/config.yaml:ro" \
+  ghcr.io/middleware-labs/otelcol-middleware-gpu:0.1.2
+
+# Follow logs:
+docker logs -f otelcol-middleware-gpu
+
+# Stop / remove:
+docker stop otelcol-middleware-gpu && docker rm otelcol-middleware-gpu
+
+
+------------------------------------------------------------------------------
+ 4. VERIFY / TROUBLESHOOT
+------------------------------------------------------------------------------
+
+# Validate the config without sending data (exits 0 if valid):
+docker run --rm \
+  -e MW_TARGET="https://example.middleware.io:443" \
+  -e MW_API_KEY="test" \
+  -v "$(pwd)/config.example.yaml:/etc/otelcol-middleware-gpu/config.yaml:ro" \
+  ghcr.io/middleware-labs/otelcol-middleware-gpu:0.1.2 \
+  validate --config=/etc/otelcol-middleware-gpu/config.yaml
+
+# List components compiled into the image:
+docker run --rm ghcr.io/middleware-labs/otelcol-middleware-gpu:0.1.2 components
+
+# No GPU on this host? The collector still starts; dcgm/nvml will log errors.
+# Drop --gpus all to run config validation or OTLP-only pipelines.
+
+
+------------------------------------------------------------------------------
+ NOTES
+------------------------------------------------------------------------------
+
+* --gpus all requires the NVIDIA Container Toolkit on the host:
+  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+
+* The runtime image is debian:bookworm-slim (a glibc base is required because
+  this is a CGO build -- a scratch image cannot run the dynamically linked
+  binary and fails with "exec ...: no such file or directory"). A shell is
+  available, so `docker exec -it otelcol-middleware-gpu sh` works for poking
+  around if needed.
+
+* The MW_API_KEY above is the beta env key embedded for convenience. Prefer
+  passing it via an env file (`--env-file ./mw.env`) or your secret manager
+  rather than committing it in scripts.
