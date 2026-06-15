@@ -1,0 +1,15 @@
+[Unit]
+Description=Minimal OpenTelemetry Collector for NVIDIA GPU telemetry, exporting to Middleware via OTLP
+After=network.target
+
+[Service]
+EnvironmentFile=/etc/otelcol-middleware-gpu/otelcol-middleware-gpu.conf
+ExecStart=/usr/bin/otelcol-middleware-gpu $OTELCOL_OPTIONS
+KillMode=mixed
+Restart=on-failure
+Type=simple
+User=otelcol-middleware-gpu
+Group=otelcol-middleware-gpu
+
+[Install]
+WantedBy=multi-user.target

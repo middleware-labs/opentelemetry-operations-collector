@@ -1,0 +1,102 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this repository is
+
+This is a **generator-first monorepo**, not a collection of hand-written collectors. The artifacts that ship (OpenTelemetry Collector distributions) are *generated* from small YAML specs by an in-repo tool called `distrogen`. Editing generated output directly is almost always the wrong move — change the spec, registry, or templates and regenerate.
+
+Three layers:
+
+1. **`distrogen`** (`cmd/distrogen/`) — a Go CLI that reads a distribution spec + component registries + templates, then renders a full distribution directory (Makefile, Dockerfiles, OCB manifest, configs, packaging scripts) and runs OCB (the OpenTelemetry Collector Builder) to produce the collector source.
+2. **Custom components** (`components/<distro>/...`) — receivers/processors/exporters maintained in this repo, each its own Go module, referenced from specs via per-distro registries.
+3. **Generated distributions** (top-level dirs: `google-built-opentelemetry-collector/`, `otelopscol/`, `middleware-gpu-collector/`) — committed output of `distrogen`. Treat as build artifacts.
+
+The distributions:
+- **`google-built-opentelemetry-collector`** — production build of upstream OTel with upstream components.
+- **`otelopscol`** — the collector backing Google Cloud's Ops Agent; carries most of the custom receivers/processors.
+- **`middleware-gpu-collector`** — minimal NVIDIA GPU telemetry collector (DCGM + NVML receivers) exporting to Middleware over OTLP. Reuses the `dcgmreceiver`/`nvmlreceiver` from `components/otelopscol/receiver/` via a custom registry.
+
+## Generation pipeline (how a distro is built)
+
+```
+specs/<distro>.yaml  +  components/<distro>/registry.yaml  +  templates/<distro>/  +  embedded registry/templates
+        │
+        ▼  distrogen generate
+generated <distro>/ directory  ──►  make ocb-generate  ──►  generated_collector/ (OCB output)  ──►  binary
+```
+
+- `distrogen` ships with an **embedded registry** (`cmd/distrogen/registry.yaml`, all upstream collector + contrib components) and an **embedded template set** (`cmd/distrogen/templates/`). Per-distro registries (`--registry`) and templates (`--templates`) are *merged on top* — same key/name overrides the embedded one.
+- The spec is unmarshaled into `DistributionSpec` (`cmd/distrogen/distribution.go`); that struct is the template context. To expose a new field to templates, add it there.
+- Generated output is committed. CI guards this via `make compare-all` (regenerates and diffs against committed output — a mismatch fails). After changing any spec/registry/template, **regenerate and commit the result**.
+
+## Common commands
+
+All from the repo root unless noted. First-time setup:
+
+```bash
+make dev-setup          # install-tools + go.work + git hooks (hooksPath -> ./hooks)
+```
+
+Regenerate distributions after editing spec/registry/template:
+
+```bash
+make gen-google-built-otel        # generate (no-op if no diff)
+make regen-google-built-otel      # force regenerate
+make compare-google-built-otel    # generate to temp + diff vs committed (CI guard)
+make gen-otelopscol   / make regen-otelopscol   / make compare-otelopscol
+make gen-middleware-gpu / make regen-middleware-gpu / make compare-middleware-gpu
+make gen-all                      # all distros + distrogen golden files
+make compare-all                  # diff-check every distro (run before pushing)
+```
+
+Update OpenTelemetry version (edit the spec's `opentelemetry_version` etc. first — see `docs/dev/update-otel.md`):
+
+```bash
+make update-google-built-otel     # update components + test + regenerate
+make update-otelopscol
+```
+
+Build a distribution (run inside its directory, e.g. `cd otelopscol`):
+
+```bash
+make build          # build the collector binary
+make image-build    # build binary + Docker image (where supported)
+make ocb-generate   # run OCB to (re)generate generated_collector/
+```
+
+Testing & linting:
+
+```bash
+make test-distrogen               # test the generator (fast, run this for distrogen changes)
+make distrogen-golden-update      # update distrogen golden testdata after intentional changes
+go test ./cmd/distrogen -run TestName   # single distrogen test
+make test-all                     # `go test` in every module (uses go.work)
+make lint                         # golangci-lint with GO_BUILD_TAGS
+make lint-fix
+make precommit                    # checklicense misspell lint compare-all test-distrogen
+```
+
+Per-component / per-module work (each component is its own module): `cd` into it and run `make test` / `make tidy` / `make generate`.
+
+## Critical conventions
+
+- **Never edit generated distribution directories by hand.** Change `specs/`, `components/<distro>/registry.yaml`, or `templates/<distro>/`, then regenerate. The committed output and `compare-all` will catch drift.
+- **`go.work` ties the modules together** for local dev. It is generated by `make workspace` (excludes `.tools`, `_build`, `dist`). Many module-spanning targets set `GOWORK=off` deliberately when they need isolated builds — don't "fix" that.
+- **Templates** are Go `text/template` files ending in `.go.tmpl`; directory structure under a `templates/<distro>/` (or the embedded set) is mirrored into the generated distro. A custom template with the same relative path overrides the embedded one. Context is the `TemplateContext`/`DistributionSpec` from `cmd/distrogen/distribution.go`.
+- **Registry merge & overrides:** to add an upstream component, add it to the embedded registry (`cmd/distrogen/registry.yaml`) then list it in the spec. To add a repo-local component, create it as its own module under `components/<distro>/<type>/`, add an entry with a `path:` (relative, starts with `..` because it's resolved from the generated distro dir) to that distro's `registry.yaml`, then list it in the spec. See `docs/dev/add-new-component.md`.
+- **GPU receivers require the `gpu` build tag.** `dcgmreceiver` and `nvmlreceiver` compile real scrapers only under `-tags=gpu` (needs CGO + NVIDIA libs); without the tag they return an expected error. Their modules use `make/gpu_common.mk`, which runs tests both with and without the tag, and strips mdatagen's `generated_component_test.go` (it doesn't tolerate the no-GPU error). The `middleware-gpu-collector` spec sets `collector_cgo: true` and `build_tags: gpu`.
+- **License headers** are enforced: `make checklicense` (fix with `make addlicense`). Google LLC for Google-owned files, Middleware Labs for Middleware-owned files (e.g. `middleware-gpu-collector` spec/registry).
+
+## distrogen CLI subcommands
+
+`go run ./cmd/distrogen <cmd>` (or the built binary):
+
+- `generate --spec <f> [--registry <f>...] [--templates <dir>] [--force] [--compare]` — render a distribution.
+- `query --spec <f> --field <name>` — print one spec field (used in Makefiles to derive versions; output is plain `Println` so it's pipe-safe).
+- `component --spec <f> --type <t> --name <n>` — scaffold a new local component.
+- `project --spec <f>` — scaffold a new distrogen project.
+- `registry` — regenerate the embedded components registry.
+- `otel_component_versions --otel_version <v>` — resolve module versions from upstream `versions.yaml` (reads module list from stdin).
+
+Flags: `-v`/`--verbose` for debug logging, `-h`/`--help`. `generate` exits 0 (not failure) when there's no diff (`ErrNoDiff`).

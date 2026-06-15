@@ -1,0 +1,118 @@
+==============================================================================
+ Middleware GPU OpenTelemetry Collector — Commands
+==============================================================================
+
+This distribution is a minimal OTel Collector focused on NVIDIA GPU telemetry
+(DCGM + NVML), exporting to Middleware over OTLP.
+
+Files that define it:
+  specs/middleware-gpu-collector.yaml              -> the distro spec (edit this to add/remove components)
+  components/middleware-gpu-collector/registry.yaml -> custom registry providing the GPU receivers
+  templates/middleware-gpu-collector/              -> custom templates dir (empty = use distrogen defaults)
+  middleware-gpu-collector/                        -> GENERATED output (do not hand-edit generated files)
+  middleware-gpu-collector/config.example.yaml     -> ready-to-use runtime config
+
+All commands below are run from the repo root:
+  /home/naman/opentelemetry-operations-collector
+
+
+------------------------------------------------------------------------------
+ 1. GENERATE / REGENERATE THE DISTRIBUTION
+------------------------------------------------------------------------------
+
+# First-time generation (fails if the output dir already exists):
+make gen-middleware-gpu
+
+# Regenerate after editing the spec or registry (overwrites existing output):
+make regen-middleware-gpu
+
+# Preview changes without writing them:
+make compare-middleware-gpu
+
+# Equivalent raw distrogen command (what the make targets run under the hood):
+go run ./cmd/distrogen generate \
+  --spec ./specs/middleware-gpu-collector.yaml \
+  --registry ./components/middleware-gpu-collector/registry.yaml \
+  --templates ./templates/middleware-gpu-collector \
+  --force
+
+
+------------------------------------------------------------------------------
+ 2. BUILD THE COLLECTOR BINARY
+------------------------------------------------------------------------------
+
+cd middleware-gpu-collector
+
+# Build the binary (installs pinned Go + OCB into ./.tools, runs OCB with the
+# "gpu" build tag, then compiles). Output binary: ./otelcol-middleware-gpu
+make build
+
+# The GPU build tag is required for the dcgm/nvml receivers to do real work.
+# It is already defaulted in the generated Makefile (COLLECTOR_BUILD_TAGS ?= gpu).
+# To build for Windows:
+make build-win
+
+# Remove downloaded tools (Go, OCB) when done:
+make clean-tools
+
+cd ..
+
+
+------------------------------------------------------------------------------
+ 3. RUN THE COLLECTOR
+------------------------------------------------------------------------------
+
+cd middleware-gpu-collector
+
+# Point these at your Middleware account:
+export MW_TARGET="https://<your-uid>.middleware.io:443"
+export MW_API_KEY="<your-middleware-api-key>"
+
+# Run with the example config:
+./otelcol-middleware-gpu --config=config.example.yaml
+
+cd ..
+
+
+------------------------------------------------------------------------------
+ 4. BUILD A DOCKER IMAGE (optional)
+------------------------------------------------------------------------------
+
+cd middleware-gpu-collector
+make image-build
+cd ..
+
+
+------------------------------------------------------------------------------
+ 5. PUBLISH TO GHCR (ghcr.io/middleware-labs)
+------------------------------------------------------------------------------
+
+# The registry (ghcr.io/middleware-labs) is hardcoded in publish.mk.
+# Assumes your shell is ALREADY logged in to ghcr.io. If not, log in once:
+#   echo "$GH_TOKEN" | docker login ghcr.io -u <user> --password-stdin
+
+cd middleware-gpu-collector
+
+# Build (inside Docker via Dockerfile.build) + push in one step:
+make -f Makefile -f publish.mk publish VERSION=0.1.0
+
+# Result: ghcr.io/middleware-labs/otelcol-middleware-gpu:0.1.0
+
+cd ..
+
+
+------------------------------------------------------------------------------
+ NOTES
+------------------------------------------------------------------------------
+
+* Requires an NVIDIA GPU with the NVIDIA driver installed on the host for the
+  dcgm/nvml receivers to collect real metrics. DCGM also needs the DCGM
+  libraries/daemon available.
+
+* To change which components are included, edit
+  specs/middleware-gpu-collector.yaml and run `make regen-middleware-gpu`.
+
+* `make build` downloads the OpenTelemetry Collector Builder (OCB) at the tag
+  matching `opentelemetry_version` in the spec. If that exact OCB tag is not yet
+  published, bump opentelemetry_version (and the contrib/stable versions) in the
+  spec to an available release, then regenerate and rebuild.

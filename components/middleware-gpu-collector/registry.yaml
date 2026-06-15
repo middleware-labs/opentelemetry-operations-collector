@@ -1,0 +1,25 @@
+# Copyright 2025 Middleware Labs
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Custom registry for the Middleware GPU collector. Only the GPU receivers
+# live in this repository; all other components resolve from the registry
+# embedded in distrogen. The dcgm and nvml receivers require the "gpu"
+# build tag (set via build_tags in the spec) to compile their real scrapers.
+receivers:
+  dcgm:
+    gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/otelopscol/receiver/dcgmreceiver v0.0.0
+    path: "../components/otelopscol/receiver/dcgmreceiver"
+  nvml:
+    gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/otelopscol/receiver/nvmlreceiver v0.0.0
+    path: "../components/otelopscol/receiver/nvmlreceiver"
