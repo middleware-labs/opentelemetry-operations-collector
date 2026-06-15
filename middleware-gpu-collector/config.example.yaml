@@ -32,7 +32,8 @@ processors:
     limit_percentage: 80
     spike_limit_percentage: 25
   # Tag metrics with host / cloud resource attributes.
-  # host.id must be explicitly requested for the system detector to emit it.
+  # host.id and host.name must be explicitly requested for the system detector
+  # to emit them.
   resourcedetection:
     detectors: [env, system]
     timeout: 5s
@@ -41,6 +42,15 @@ processors:
       resource_attributes:
         host.id:
           enabled: true
+        host.name:
+          enabled: true
+  # Copy the detected host.name into host.id so both carry the hostname.
+  # Must run AFTER resourcedetection (host.name is set there).
+  transform/host_id_from_name:
+    metric_statements:
+      - context: resource
+        statements:
+          - set(attributes["host.id"], attributes["host.name"]) where attributes["host.name"] != nil
   # Promote the per-GPU nvml datapoint attributes (gpu_number, uuid, model)
   # up to resource attributes so each GPU is identified at the resource level.
   transform/gpu_to_resource:
@@ -147,6 +157,7 @@ service:
         - memory_limiter
         - transform/gpu_to_resource
         - resourcedetection
+        - transform/host_id_from_name
         - metricstransform
         - cumulativetodelta
         - deltatorate
